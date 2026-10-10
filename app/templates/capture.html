@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf }}">
+  <title>Verifikasi KTP</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='capture.css') }}">
+</head>
+<body>
+  <main class="card">
+    <section id="capture">
+      <header>
+        <p class="step" id="step-label">Langkah 1 dari 2</p>
+        <h1 id="title">Foto KTP</h1>
+        <p class="hint" id="hint">Letakkan KTP di dalam bingkai, rata, tanpa pantulan cahaya.</p>
+      </header>
+
+      <div class="stage">
+        <video id="video" autoplay playsinline muted></video>
+        <img id="preview" alt="Hasil foto" hidden>
+        <div class="frame" id="frame" aria-hidden="true"></div>
+      </div>
+
+      <p class="error" id="error" role="alert" hidden></p>
+
+      <div class="actions">
+        <button id="shoot" type="button">Ambil foto</button>
+        <button id="retake" type="button" class="secondary" hidden>Ulangi</button>
+        <button id="accept" type="button" hidden>Gunakan foto</button>
+      </div>
+    </section>
+
+    <section id="done" hidden>
+      <h1>Terkirim</h1>
+      <p class="hint">Data Anda sedang diverifikasi. Anda boleh menutup halaman ini.</p>
+    </section>
+  </main>
+  <script src="{{ url_for('static', path='capture.js') }}"></script>
+</body>
+</html>

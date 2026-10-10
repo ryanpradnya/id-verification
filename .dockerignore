@@ -1,0 +1,9 @@
+.venv
+.git
+.env
+models
+tests/fixtures
+**/__pycache__
+.pytest_cache
+.ruff_cache
+.serena
