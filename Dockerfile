@@ -4,7 +4,9 @@ COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /usr/local/bin/uv
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     PYTHONUNBUFFERED=1 \
-    PATH="/app/.venv/bin:$PATH"
+    PATH="/app/.venv/bin:$PATH" \
+    MODELS_DIR=/app/models \
+    DATA_DIR=/data
 WORKDIR /app
 
 RUN apt-get update \
@@ -12,17 +14,19 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-dev --all-extras --no-install-project
 
 # Biometric models baked into the image, verified against pinned SHA-256.
-COPY scripts/download_models.py scripts/
-RUN python scripts/download_models.py
+COPY src/id_verification/core/models.py /tmp/models.py
+RUN python /tmp/models.py /app/models
 
-COPY . .
-RUN uv sync --frozen --no-dev
+COPY README.md LICENSE ./
+COPY src ./src
+RUN uv sync --frozen --no-dev --all-extras
 
-RUN useradd --system --uid 1000 app
+RUN useradd --system --uid 1000 app && mkdir -p /data && chown app /data
 USER app
+VOLUME /data
 
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+CMD ["id-verification", "serve", "--host", "0.0.0.0", "--port", "8000"]

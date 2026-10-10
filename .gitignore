@@ -8,3 +8,5 @@ models/*.onnx
 # Real people's ID cards: never commit. Put local samples here for tests.
 tests/fixtures/
 .serena/
+data/
+dist/

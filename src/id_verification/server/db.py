@@ -6,12 +6,13 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from functools import lru_cache
+from pathlib import Path
 
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from app.config import get_settings
+from id_verification.config import get_settings
 
 JSONType = JSON().with_variant(JSONB(), "postgresql")
 
@@ -55,6 +56,7 @@ class Verification(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|processing|completed|failed
     decision: Mapped[str | None] = mapped_column(String(20))  # approved|rejected
     reason_codes: Mapped[list] = mapped_column(JSONType, default=list)
+    skipped_checks: Mapped[list] = mapped_column(JSONType, default=list)
     ktp_enc: Mapped[str | None] = mapped_column(Text)  # Fernet(JSON KtpData), wiped at retention
     scores: Mapped[dict] = mapped_column(JSONType, default=dict)
     ktp_key: Mapped[str] = mapped_column(Text)
@@ -72,6 +74,7 @@ class CaptureSession(Base):
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     external_ref: Mapped[str | None] = mapped_column(String(200))
     callback_url: Mapped[str | None] = mapped_column(Text)
+    redirect_url: Mapped[str | None] = mapped_column(Text)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     verification_id: Mapped[str | None] = mapped_column(ForeignKey("verifications.id"))
@@ -88,8 +91,12 @@ class AuditEvent(Base):
 
 @lru_cache
 def engine():
-    url = get_settings().database_url
-    args = {"check_same_thread": False} if url.startswith("sqlite") else {}
+    s = get_settings()
+    url = s.db_url
+    args = {}
+    if url.startswith("sqlite"):
+        args = {"check_same_thread": False}
+        s.data_dir.mkdir(parents=True, exist_ok=True)
     return create_engine(url, pool_pre_ping=True, connect_args=args)
 
 
@@ -107,3 +114,13 @@ def session() -> Iterator[Session]:
 def get_db() -> Iterator[Session]:
     with session() as s:
         yield s
+
+
+def migrate() -> None:
+    """Bring the database schema to the latest version (alembic upgrade head)."""
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config()
+    cfg.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
+    command.upgrade(cfg, "head")

@@ -1,113 +1,106 @@
-"""Celery worker: runs the verification graph, delivers signed webhooks, purges old images.
+"""Background jobs as plain functions: run a verification, deliver its webhook, purge old data.
 
-Run: celery -A app.worker worker --beat --loglevel=info
+They know nothing about the queue. A job raises Retry(after) to be run again later;
+server.queue runs them in-process (lite) or on Celery (REDIS_URL set).
 """
 
 import asyncio
 import logging
+import threading
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from functools import lru_cache
 
 import httpx
-from celery import Celery
 from sqlalchemy import select
 
-from app import security, storage
-from app.config import get_settings
-from app.db import AuditEvent, Tenant, Verification, session, utcnow
-from app.pipeline.graph import build_graph
-from app.pipeline.llm import LLM, ProviderError
-from app.schemas import verification_out
+from id_verification.config import get_settings
+from id_verification.core.llm import ProviderError
+from id_verification.core.verifier import Verifier, scores
+from id_verification.server import security, storage
+from id_verification.server.db import AuditEvent, Tenant, Verification, session, utcnow
+from id_verification.server.schemas import verification_out
 
 log = logging.getLogger(__name__)
-settings = get_settings()
 
-celery = Celery("kyc", broker=settings.redis_url)
-celery.conf.update(
-    task_acks_late=True,  # a crashed worker's job goes back to the queue
-    task_reject_on_worker_lost=True,
-    worker_prefetch_multiplier=1,
-    task_ignore_result=True,
-    broker_connection_retry_on_startup=True,
-    beat_schedule={"purge-expired-images": {"task": "app.worker.purge_expired", "schedule": 24 * 3600}},
-)
+VERIFY_MAX_RETRIES = 3
+WEBHOOK_MAX_RETRIES = 6
+
+
+class Retry(Exception):  # noqa: N818  control flow, not an error
+    def __init__(self, after: float):
+        self.after = after
 
 
 @lru_cache
-def _graph():
-    return build_graph(LLM(settings), settings)
+def _verifier() -> Verifier:
+    return Verifier(get_settings())
 
 
 @lru_cache
 def _loop() -> asyncio.AbstractEventLoop:
-    # One loop per worker process: LLM SDK async clients are bound to the loop they were created on.
-    return asyncio.new_event_loop()
+    # One loop thread per process: LLM SDK async clients are bound to the loop they were created on,
+    # and several worker threads share them.
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, name="idv-loop", daemon=True).start()
+    return loop
 
 
 def _audit(db, vid: str, step: str, payload: dict) -> None:
     db.add(AuditEvent(verification_id=vid, step=step, payload=payload))
 
 
-def _record(db, v: Verification, out: dict) -> None:
+def _record(db, v: Verification, out: dict, model: str) -> None:
     ex, review, face = out.get("extraction"), out.get("review"), out.get("face") or {}
     data = ex.data if ex else None
     v.decision = out["decision"]
     v.reason_codes = out["reasons"]
+    v.skipped_checks = out["skipped_checks"]
     v.ktp_enc = security.encrypt_str(data.model_dump_json()) if data else None
-    v.scores = {
-        "face_similarity": face.get("face_similarity"),
-        "liveness": face.get("liveness_score"),
-        "llm_same_person": review.same_person if review else None,
-    }
+    v.scores = scores(out)
     _audit(db, v.id, "preprocess", {"issues": out.get("image_issues", []), "quality": out.get("quality", {})})
     if ex:
         flags = ex.model_dump(exclude={"data"})
         nik = security.mask_nik(data.nik) if data else None
-        _audit(db, v.id, "ktp_extract", {**flags, "model": settings.llm_model, "nik": nik})
+        _audit(db, v.id, "ktp_extract", {**flags, "model": model, "nik": nik})
         _audit(db, v.id, "nik_rules", {"codes": out.get("nik_codes", [])})
     if face:
         _audit(db, v.id, "biometrics", face)
     if review:
-        _audit(db, v.id, "llm_review", {**review.model_dump(), "model": settings.llm_model})
-    _audit(db, v.id, "decide", {"decision": v.decision, "reasons": v.reason_codes})
+        _audit(db, v.id, "llm_review", {**review.model_dump(), "model": model})
+    _audit(db, v.id, "decide", {"decision": v.decision, "reasons": v.reason_codes, "skipped": v.skipped_checks})
 
 
-@celery.task(bind=True, max_retries=3)
-def process_verification(self, vid: str) -> None:
+def process_verification(vid: str, attempt: int = 0) -> None:
     with session() as db:
         v = db.get(Verification, vid)
         if v is None or v.status in ("completed", "failed"):
             return
         v.status = "processing"
         db.commit()
+        verifier = _verifier()
         try:
-            state = {
-                "ktp": storage.get(v.ktp_key),
-                "selfie": storage.get(v.selfie_key),
-                "today": datetime.now(UTC).date(),
-            }
-            out = _loop().run_until_complete(_graph().ainvoke(state))
+            coro = verifier.run(storage.get(v.ktp_key), storage.get(v.selfie_key))
+            out = asyncio.run_coroutine_threadsafe(coro, _loop()).result()
         except Exception as e:
-            log.warning("verification %s attempt %s failed: %s", vid, self.request.retries + 1, type(e).__name__)
-            if self.request.retries < self.max_retries:
+            log.warning("verification %s attempt %s failed: %s", vid, attempt + 1, type(e).__name__)
+            if attempt < VERIFY_MAX_RETRIES:
                 v.status = "pending"
                 db.commit()
-                raise self.retry(exc=e, countdown=10 * 2**self.request.retries) from e
+                raise Retry(10 * 2**attempt) from e
             # A provider outage is a system failure, never a rejection.
             v.status = "failed"
             v.error = "AI_PROVIDER_UNAVAILABLE" if isinstance(e, ProviderError) else "INTERNAL_ERROR"
             _audit(db, vid, "error", {"error": v.error, "type": type(e).__name__})
         else:
-            _record(db, v, out)
+            _record(db, v, out, verifier.settings.llm_model)
             v.status = "completed"
         v.completed_at = utcnow()
         db.commit()
-    deliver_webhook.delay(vid)
 
 
-@celery.task(bind=True, max_retries=6)
-def deliver_webhook(self, vid: str) -> None:
+def deliver_webhook(vid: str, attempt: int = 0) -> None:
+    settings = get_settings()
     with session() as db:
         v = db.get(Verification, vid)
         tenant = db.get(Tenant, v.tenant_id)
@@ -122,7 +115,6 @@ def deliver_webhook(self, vid: str) -> None:
             return
         body = verification_out(v).model_dump_json().encode()
         sig = security.sign_webhook(security.decrypt_str(tenant.webhook_secret_enc), body, int(time.time()))
-        attempt = self.request.retries + 1
         try:
             resp = httpx.post(
                 url,
@@ -132,19 +124,18 @@ def deliver_webhook(self, vid: str) -> None:
                 follow_redirects=False,
             )
             ok = resp.status_code < 300
-            _audit(db, vid, "webhook", {"status_code": resp.status_code, "attempt": attempt})
+            _audit(db, vid, "webhook", {"status_code": resp.status_code, "attempt": attempt + 1})
         except httpx.HTTPError as e:
             ok = False
-            _audit(db, vid, "webhook", {"error": type(e).__name__, "attempt": attempt})
+            _audit(db, vid, "webhook", {"error": type(e).__name__, "attempt": attempt + 1})
         db.commit()
-    if not ok and self.request.retries < self.max_retries:
-        raise self.retry(countdown=30 * 2**self.request.retries)
+    if not ok and attempt < WEBHOOK_MAX_RETRIES:
+        raise Retry(30 * 2**attempt)
 
 
-@celery.task
 def purge_expired() -> int:
     """Delete images and full KTP data past the retention window. Decisions and audit stay."""
-    cutoff = utcnow() - timedelta(days=settings.retention_days)
+    cutoff = utcnow() - timedelta(days=get_settings().retention_days)
     with session() as db:
         rows = db.scalars(
             select(Verification).where(Verification.created_at < cutoff, Verification.images_deleted_at.is_(None))

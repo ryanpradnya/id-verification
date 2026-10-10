@@ -1,8 +1,10 @@
 """Verification pipeline as a LangGraph StateGraph.
 
+LLM mode:
 preprocess ─┬─► ktp_extract (LLM) ─► nik_rules ─┐
             └─► biometrics (local) ─────────────┴─► llm_review (LLM) ─► decide
-any image issue short-circuits straight to decide.
+No-LLM mode (llm=None): ktp_extract uses local OCR and llm_review is skipped.
+Any image issue short-circuits straight to decide.
 """
 
 import asyncio
@@ -11,11 +13,14 @@ from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from app.config import Settings
-from app.pipeline import decide as policy
-from app.pipeline import face, images
-from app.pipeline.ktp import KtpExtraction, nik_rules
-from app.pipeline.llm import LLM, Review
+from id_verification.config import Settings
+from id_verification.core import decide as policy
+from id_verification.core import face, images
+from id_verification.core.ktp import KtpExtraction, nik_rules
+from id_verification.core.llm import LLM, Review
+
+# Checks only an LLM can do. Reported, never silently passed.
+NO_LLM_SKIPPED = ["KTP_RECAPTURE", "KTP_TAMPER", "LLM_REVIEW"]
 
 
 class State(TypedDict, total=False):
@@ -33,9 +38,10 @@ class State(TypedDict, total=False):
     # output
     reasons: list[str]
     decision: str
+    skipped_checks: list[str]
 
 
-def build_graph(llm: LLM, s: Settings):
+def build_graph(llm: LLM | None, s: Settings):
     def _reasons(st: State, require_review: bool) -> list[str]:
         return policy.reasons(
             image_issues=st.get("image_issues", []),
@@ -60,6 +66,10 @@ def build_graph(llm: LLM, s: Settings):
         return ["decide"] if st["image_issues"] else ["ktp_extract", "biometrics"]
 
     async def ktp_extract(st: State) -> State:
+        if llm is None:
+            from id_verification.core import ocr  # lazy: optional [ocr] extra
+
+            return {"extraction": await asyncio.to_thread(ocr.extract_ktp, st["ktp"])}
         return {"extraction": await llm.extract_ktp(st["ktp"])}
 
     def nik(st: State) -> State:
@@ -71,14 +81,14 @@ def build_graph(llm: LLM, s: Settings):
         return {"face": await asyncio.to_thread(face.analyze, ktp, selfie, s.models_dir)}
 
     async def llm_review(st: State) -> State:
-        if _reasons(st, require_review=False):
-            return {}  # already rejected, skip the second (paid) LLM call
+        if llm is None or _reasons(st, require_review=False):
+            return {}  # no LLM, or already rejected: skip the second (paid) LLM call
         d = st["extraction"].data
         return {"review": await llm.review(st["ktp"], st["selfie"], d.nik, d.nama)}
 
     def decide(st: State) -> State:
-        r = _reasons(st, require_review=True)
-        return {"reasons": r, "decision": policy.decision(r)}
+        r = _reasons(st, require_review=llm is not None)
+        return {"reasons": r, "decision": policy.decision(r), "skipped_checks": [] if llm else NO_LLM_SKIPPED}
 
     g = StateGraph(State)
     g.add_node("preprocess", preprocess)

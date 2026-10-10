@@ -5,8 +5,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from app import security
-from app.db import Verification
+from id_verification.server import security
+from id_verification.server.db import Verification
 
 
 class VerificationJSON(BaseModel):
@@ -19,6 +19,9 @@ class VerificationJSON(BaseModel):
 class SessionCreate(BaseModel):
     external_ref: str | None = Field(None, max_length=200)
     callback_url: str | None = None
+    redirect_url: str | None = Field(
+        None, description="Browser goes here after submit, with ?session_id=. Never carries the result."
+    )
 
 
 class SessionOut(BaseModel):
@@ -38,6 +41,7 @@ class VerificationOut(BaseModel):
     status: str
     decision: str | None
     reason_codes: list[str]
+    skipped_checks: list[str] = Field(description="Checks that could not run in this mode (no-LLM)")
     ktp: KtpSummary | None
     scores: dict
     error: str | None
@@ -56,6 +60,7 @@ def verification_out(v: Verification) -> VerificationOut:
         status=v.status,
         decision=v.decision,
         reason_codes=v.reason_codes or [],
+        skipped_checks=v.skipped_checks or [],
         ktp=ktp,
         scores=v.scores or {},
         error=v.error,

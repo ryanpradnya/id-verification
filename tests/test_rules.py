@@ -1,23 +1,20 @@
-"""Pure-function checks: NIK rules, decision policy, security helpers."""
+"""Pure-function checks: NIK rules and decision policy."""
 
-import hashlib
-import hmac
 from datetime import date
 
 import pytest
 
-from app import security
-from app.pipeline.decide import decision, reasons
-from app.pipeline.ktp import KtpData, KtpExtraction, nik_rules
-from app.pipeline.llm import Review
+from id_verification.core.decide import decision, reasons
+from id_verification.core.ktp import KtpData, KtpExtraction, nik_rules
+from id_verification.core.llm import Review
 
 TODAY = date(2026, 10, 10)
 
 
 def ktp(**kw) -> KtpData:
     base = dict(
-        nik="7471031102020001",  # Sulawesi Tenggara, 11-02-02, male
-        nama="MUH. QASHRUDDIN KASO",
+        nik="7471091102020007",  # synthetic: Sulawesi Tenggara, 11-02-02, male
+        nama="ANDI SPESIMEN",
         tanggal_lahir=date(2002, 2, 11),
         jenis_kelamin="LAKI-LAKI",
         kewarganegaraan="WNI",
@@ -56,10 +53,10 @@ def test_nik_failures(kw, code):
 def test_expiry_only_applies_to_foreigners():
     # Citizens: lifetime validity even with an old printed date.
     assert nik_rules(ktp(berlaku_hingga="2017-09-04"), TODAY) == []
-    # ktp1 sample: WNA (CHINA), expired 2023-12-12.
+    # Synthetic WNA (foreigner) card, expired 2023-12-12.
     wna = ktp(
-        nik="3203012503770011",
-        tanggal_lahir=date(1977, 3, 25),
+        nik="3203091503800007",
+        tanggal_lahir=date(1980, 3, 15),
         provinsi="JAWA BARAT",
         kewarganegaraan="CHINA",
         berlaku_hingga="2023-12-12",
@@ -93,6 +90,11 @@ def r(**kw):
 
 def test_all_good_approves():
     assert r() == []
+
+
+def test_missing_review_blocks_llm_mode_but_not_no_llm_mode():
+    assert r(review=None) == ["REVIEW_INCOMPLETE"]
+    assert r(review=None, require_review=False) == []  # no-LLM: local checks decide, skipped_checks reported
     assert decision(r()) == "approved"
 
 
@@ -126,36 +128,3 @@ def test_each_failure_rejects(kw, code):
 
 def test_card_not_visible_is_not_a_failure():
     assert r(review=GOOD_REVIEW.model_copy(update={"selfie_card_matches_ktp": None})) == []
-
-
-def test_webhook_signature_roundtrip():
-    body = b'{"id":"x"}'
-    header = security.sign_webhook("whsec", body, 1700000000)
-    t, v1 = (p.split("=", 1)[1] for p in header.split(","))
-    expected = hmac.new(b"whsec", f"{t}.".encode() + body, hashlib.sha256).hexdigest()
-    assert t == "1700000000" and hmac.compare_digest(v1, expected)
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "http://example.com/hook",
-        "https://127.0.0.1/hook",
-        "https://10.0.0.5/x",
-        "https://169.254.169.254/latest",
-        "https://localhost/x",
-        "ftp://example.com",
-    ],
-)
-def test_ssrf_guard_blocks(url):
-    with pytest.raises(ValueError):
-        security.check_webhook_url(url)
-
-
-def test_ssrf_guard_allows_public_ip():
-    security.check_webhook_url("https://1.1.1.1/hook")
-
-
-def test_mask_and_encrypt():
-    assert security.mask_nik("7471031102020001") == "7471********0001"
-    assert security.decrypt_str(security.encrypt_str("rahasia")) == "rahasia"

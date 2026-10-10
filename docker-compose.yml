@@ -1,64 +1,26 @@
-x-app: &app
-  build: .
-  env_file: .env
-  environment:
-    DATABASE_URL: postgresql+psycopg://kyc:kyc@postgres:5432/kyc
-    REDIS_URL: redis://redis:6379/0
-    S3_ENDPOINT_URL: http://s3:8333
-  restart: unless-stopped
+# Lite self-hosting: one container, SQLite + encrypted files in the "idv" volume, in-process worker.
+#   docker compose up -d
+#   docker compose exec idv id-verification create-tenant --name acme --webhook-url https://...
+# Fully local model too:  docker compose --profile ollama up -d
+#   then set LLM_MODEL=openai:qwen2.5vl:7b and LLM_BASE_URL=http://ollama:11434/v1 in .env
+#   and pull the model once: docker compose exec ollama ollama pull qwen2.5vl:7b
+# For Postgres + Redis/Celery + S3 at scale, use docker-compose.scale.yml.
 
 services:
-  postgres:
-    image: postgres:17-alpine
-    environment:
-      POSTGRES_USER: kyc
-      POSTGRES_PASSWORD: kyc
-      POSTGRES_DB: kyc
-    volumes: [pgdata:/var/lib/postgresql/data]
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U kyc"]
-      interval: 3s
-      retries: 20
-    restart: unless-stopped
-
-  redis:
-    image: redis:8-alpine
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 3s
-      retries: 20
-    restart: unless-stopped
-
-  # Local S3-compatible storage. In production point S3_* at real S3 / R2 / etc. and remove this.
-  s3:
-    image: chrislusf/seaweedfs:latest
-    command: server -dir=/data -s3 -s3.port=8333
-    volumes: [s3data:/data]
-    restart: unless-stopped
-
-  migrate:
-    <<: *app
-    command: sh -c "alembic upgrade head && python -m app.cli ensure-bucket"
-    restart: "no"
-    depends_on:
-      postgres: {condition: service_healthy}
-      s3: {condition: service_started}
-
-  api:
-    <<: *app
+  idv:
+    build: .
+    image: ghcr.io/ryanpradnya/id-verification:latest
+    env_file: .env
     ports: ["8000:8000"]
-    depends_on:
-      migrate: {condition: service_completed_successfully}
-      redis: {condition: service_healthy}
+    volumes: [idv:/data]
+    restart: unless-stopped
 
-  worker:
-    <<: *app
-    # --beat runs the daily retention purge. With several worker replicas, run beat as its own service.
-    command: celery -A app.worker worker --beat --schedule /tmp/celerybeat-schedule --loglevel=info --concurrency=2
-    depends_on:
-      migrate: {condition: service_completed_successfully}
-      redis: {condition: service_healthy}
+  ollama:
+    profiles: [ollama]
+    image: ollama/ollama:latest
+    volumes: [ollama:/root/.ollama]
+    restart: unless-stopped
 
 volumes:
-  pgdata:
-  s3data:
+  idv:
+  ollama:

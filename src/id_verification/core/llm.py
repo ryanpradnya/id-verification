@@ -1,18 +1,24 @@
 """Vision LLM calls. Provider-agnostic via LangChain init_chat_model.
 
 LLM_MODEL examples: "anthropic:claude-sonnet-5-5", "openai:gpt-5", "openrouter:google/gemini-2.5-pro",
-"google_genai:gemini-2.5-pro" (install langchain-google-genai). The model must accept images.
-The LLM never decides: it returns structured signals that app.pipeline.decide turns into a decision.
+or any OpenAI-compatible local server: "openai:qwen2.5vl:7b" + LLM_BASE_URL=http://localhost:11434/v1.
+The model must accept images.
+The LLM never decides: it returns structured signals that core.decide turns into a decision.
 """
 
 import base64
+import json
+import logging
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.utils.json import parse_json_markdown
 from pydantic import BaseModel, Field
 
-from app.config import Settings
-from app.pipeline.ktp import KtpExtraction
+from id_verification.config import Settings
+from id_verification.core.ktp import KtpExtraction
+
+log = logging.getLogger(__name__)
 
 SYSTEM = (
     "You are a KYC document examiner for Indonesian identity verification. "
@@ -35,6 +41,8 @@ REVIEW_PROMPT = (
     "(c) if a card is visible in image 2, does it appear to be the same card (NIK/name/photo) as image 1; "
     "use null if no card is visible or it is unreadable."
 )
+
+JSON_PROMPT = "\n\nReply with only one JSON object, no prose, matching this JSON schema:\n{schema}"
 
 
 class Review(BaseModel):
@@ -69,6 +77,12 @@ def _method(model_id: str, s: Settings) -> str | None:
     return "json_schema" if model_id.startswith("anthropic:") else None
 
 
+def _unreachable(e: Exception) -> bool:
+    # Network trouble: retrying the same server with a different prompt will not help.
+    name = type(e).__name__
+    return "Timeout" in name or "Connection" in name
+
+
 class LLM:
     def __init__(self, s: Settings):
         self.model_id = s.llm_model
@@ -77,18 +91,37 @@ class LLM:
             # Fallback reads its key from the provider's own env var (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...).
             self._models.append((_build(s.llm_fallback_model, s, primary=False), _method(s.llm_fallback_model, s)))
 
-    def _structured(self, schema):
-        primary, *fallbacks = (
-            m.with_structured_output(schema, **({"method": method} if method else {})) for m, method in self._models
-        )
-        return primary.with_fallbacks(fallbacks) if fallbacks else primary
+    async def _structured(self, model, method, schema, msgs):
+        kwargs = {"method": method} if method else {}
+        out = await model.with_structured_output(schema, **kwargs).ainvoke(msgs)
+        if out is None:  # some providers return None instead of raising when no tool call came back
+            raise ValueError("no structured output")
+        return out
+
+    async def _prompted_json(self, model, schema, msgs):
+        """For small local models that cannot do tool calls or JSON schema: ask for JSON, parse it."""
+        prompt = JSON_PROMPT.format(schema=json.dumps(schema.model_json_schema()))
+        head, human = msgs
+        human = HumanMessage([{**human.content[0], "text": human.content[0]["text"] + prompt}, *human.content[1:]])
+        reply = await model.ainvoke([head, human])
+        return schema.model_validate(parse_json_markdown(reply.text))
 
     async def _ask(self, schema, prompt: str, *images: bytes):
         msgs = [SystemMessage(SYSTEM), HumanMessage([{"type": "text", "text": prompt}, *map(_image, images)])]
-        try:
-            return await self._structured(schema).ainvoke(msgs)
-        except Exception as e:
-            raise ProviderError(f"{type(e).__name__}: {e}") from e
+        errors = []
+        for model, method in self._models:
+            try:
+                return await self._structured(model, method, schema, msgs)
+            except Exception as e:
+                errors.append(f"{type(e).__name__}: {e}")
+                if _unreachable(e):
+                    continue
+            try:
+                return await self._prompted_json(model, schema, msgs)
+            except Exception as e:
+                errors.append(f"json fallback {type(e).__name__}: {e}")
+        log.warning("all AI providers failed: %s", errors)
+        raise ProviderError("; ".join(errors))
 
     async def extract_ktp(self, ktp: bytes) -> KtpExtraction:
         return await self._ask(KtpExtraction, EXTRACT_PROMPT, ktp)

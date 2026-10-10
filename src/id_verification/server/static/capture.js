@@ -67,10 +67,9 @@
       const res = await fetch(location.pathname + "/submit", {
         method: "POST", body: form, headers: { "X-CSRF-Token": csrf }, credentials: "same-origin",
       });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error((body.error && body.error.message) || res.statusText);
-      }
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error((body.error && body.error.message) || res.statusText);
+      if (body.redirect_url) { location.assign(body.redirect_url); return; }
       show($("capture"), false); show($("done"), true);
     } catch (e) {
       accept.disabled = retake.disabled = false;

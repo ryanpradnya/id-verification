@@ -1,17 +1,17 @@
 from logging.config import fileConfig
 
+from alembic import context
 from sqlalchemy import create_engine, pool
 
-from alembic import context
-from app.config import get_settings
-from app.db import Base
+from id_verification.config import get_settings
+from id_verification.server.db import Base
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# The URL comes from DATABASE_URL (app settings), never from alembic.ini.
-url = get_settings().database_url
+# The URL comes from DATABASE_URL (default: SQLite in DATA_DIR), never from alembic.ini.
+url = get_settings().db_url
 target_metadata = Base.metadata
 
 
@@ -24,8 +24,11 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
+    if url.startswith("sqlite"):
+        get_settings().data_dir.mkdir(parents=True, exist_ok=True)
+    # render_as_batch: SQLite cannot ALTER most things in place; batch mode copies the table.
     with create_engine(url, poolclass=pool.NullPool).connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        context.configure(connection=connection, target_metadata=target_metadata, render_as_batch=True)
         with context.begin_transaction():
             context.run_migrations()
 

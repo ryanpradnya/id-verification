@@ -1,7 +1,7 @@
 """The decision policy. Pure function: same signals in, same decision out. No AI here."""
 
-from app.pipeline.ktp import KtpExtraction
-from app.pipeline.llm import Review
+from id_verification.core.ktp import KtpExtraction
+from id_verification.core.llm import Review
 
 
 def reasons(

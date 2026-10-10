@@ -6,19 +6,20 @@ from datetime import date
 
 import pytest
 
-from app.config import get_settings
-from app.pipeline.graph import build_graph
-from app.pipeline.images import sanitize
-from app.pipeline.ktp import KtpData, KtpExtraction
-from app.pipeline.llm import ProviderError, Review
-from tests.conftest import fixture_bytes, make_tenant
+from id_verification.config import get_settings
+from id_verification.core.graph import NO_LLM_SKIPPED, build_graph
+from id_verification.core.images import sanitize
+from id_verification.core.ktp import KtpData, KtpExtraction
+from id_verification.core.llm import ProviderError, Review
+from id_verification.core.verifier import Verifier
+from tests.conftest import HAS_SERVER, SPECIMEN, fixture_bytes, make_tenant
 
 settings = get_settings()
 if not (settings.models_dir / "MiniFASNetV2.onnx").exists():
-    pytest.skip("models missing: run `uv run python scripts/download_models.py`", allow_module_level=True)
+    pytest.skip("models missing: run `id-verification download-models` with MODELS_DIR=models", allow_module_level=True)
 
-SELFIE2_KTP = KtpData(  # plausible data; the fake LLM "reads" it
-    nik="3601127005800002",
+SELFIE2_KTP = KtpData(  # synthetic data; the fake LLM "reads" it
+    nik="3601097005800007",
     nama="TEST PEREMPUAN",
     tanggal_lahir=date(1980, 5, 30),
     jenis_kelamin="PEREMPUAN",
@@ -27,9 +28,9 @@ SELFIE2_KTP = KtpData(  # plausible data; the fake LLM "reads" it
     provinsi="BANTEN",
 )
 KTP1 = KtpData(
-    nik="3203012503770011",
-    nama="GUOHUI CHEN",
-    tanggal_lahir=date(1977, 3, 25),
+    nik="3203091503800007",
+    nama="WNA SPESIMEN",
+    tanggal_lahir=date(1980, 3, 15),
     jenis_kelamin="LAKI-LAKI",
     kewarganegaraan="CHINA",
     berlaku_hingga="2023-12-12",
@@ -91,10 +92,11 @@ def test_small_image_short_circuits():
     assert "extraction" not in out
 
 
+@pytest.mark.skipif(not HAS_SERVER, reason="needs the [server] extra")
 def test_worker_end_to_end(fake_infra, monkeypatch):
-    import app.worker as worker
-    from app.db import AuditEvent, Verification, session
-    from app.schemas import verification_out
+    from id_verification.server import jobs
+    from id_verification.server.db import AuditEvent, Verification, session
+    from id_verification.server.schemas import verification_out
 
     blobs, _ = fake_infra
     tenant, _ = make_tenant()
@@ -103,22 +105,37 @@ def test_worker_end_to_end(fake_infra, monkeypatch):
     with session() as db:
         db.add(Verification(id="v1", tenant_id=tenant.id, ktp_key="k", selfie_key="s"))
         db.add(Verification(id="v2", tenant_id=tenant.id, ktp_key="k", selfie_key="s"))
+        db.add(Verification(id="v3", tenant_id=tenant.id, ktp_key="k", selfie_key="s"))
         db.commit()
 
-    monkeypatch.setattr(worker, "_graph", lambda: build_graph(FakeLLM(SELFIE2_KTP), settings))
-    worker.process_verification("v1")
+    monkeypatch.setattr(jobs, "_verifier", lambda: Verifier(settings, llm=FakeLLM(SELFIE2_KTP)))
+    jobs.process_verification("v1")
 
-    monkeypatch.setattr(worker, "_graph", lambda: build_graph(FakeLLM(SELFIE2_KTP, fail=True), settings))
-    monkeypatch.setattr(worker.process_verification, "max_retries", 0)
-    worker.process_verification("v2")
+    monkeypatch.setattr(jobs, "_verifier", lambda: Verifier(settings, llm=FakeLLM(SELFIE2_KTP, fail=True)))
+    with pytest.raises(jobs.Retry):  # retries left: back to pending, never a rejection
+        jobs.process_verification("v3")
+    jobs.process_verification("v2", attempt=jobs.VERIFY_MAX_RETRIES)
 
     with session() as db:
         ok = verification_out(db.get(Verification, "v1"))
-        assert ok.status == "completed" and ok.decision == "approved"
+        assert ok.status == "completed" and ok.decision == "approved" and ok.skipped_checks == []
         assert ok.ktp.nik == SELFIE2_KTP.nik and ok.ktp.nama == SELFIE2_KTP.nama
         assert set(ok.ktp.model_dump()) == {"nik", "nama"}  # never the full KTP
         steps = {e.step for e in db.query(AuditEvent).filter_by(verification_id="v1")}
         assert {"preprocess", "ktp_extract", "biometrics", "llm_review", "decide"} <= steps
 
+        assert db.get(Verification, "v3").status == "pending"
         failed = db.get(Verification, "v2")
         assert failed.status == "failed" and failed.error == "AI_PROVIDER_UNAVAILABLE" and failed.decision is None
+
+
+def test_no_llm_mode_reports_skipped_checks():
+    pytest.importorskip("rapidocr")
+    v = Verifier(settings.model_copy(update={"llm_model": "none"}))
+    assert v.mode == "no-llm"
+    # Specimen has no face: rejected on biometrics, but the OCR read and NIK rules ran.
+    r = asyncio.run(v.verify(SPECIMEN.read_bytes(), fixture_bytes("selfie2.png")))
+    assert r.nik == "3171011208900001" and r.nama == "BUDI SPESIMEN"
+    assert r.skipped_checks == NO_LLM_SKIPPED
+    assert r.decision == "rejected" and "KTP_FACE_NOT_FOUND" in r.reasons
+    assert not any(c.startswith("NIK_") for c in r.reasons)

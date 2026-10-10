@@ -4,17 +4,22 @@ import base64
 from datetime import timedelta
 
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import update
 
-from app.db import CaptureSession, session, utcnow
-from app.main import app
-from tests.conftest import jpeg, make_tenant
+pytest.importorskip("fastapi")  # needs the [server] extra
+
+from fastapi import FastAPI  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import update  # noqa: E402
+
+from id_verification.server import app as app_module  # noqa: E402
+from id_verification.server.app import create_app  # noqa: E402
+from id_verification.server.db import CaptureSession, session, utcnow  # noqa: E402
+from tests.conftest import jpeg, make_tenant  # noqa: E402
 
 
 @pytest.fixture
 def client(fake_infra):
-    return TestClient(app)
+    return TestClient(create_app())
 
 
 def files():
@@ -35,7 +40,7 @@ def test_multipart_create_and_get(client, fake_infra):
     assert r.status_code == 202, r.text
     body = r.json()
     assert body["status"] == "pending" and body["external_ref"] == "u-1" and body["ktp"] is None
-    assert queued == [body["id"]]
+    assert queued == [("process_verification", body["id"])]
     assert len(blobs) == 2 and all(v.startswith(b"\xff\xd8") for v in blobs.values())  # re-encoded JPEG
 
     got = client.get(f"/v1/verifications/{body['id']}", headers={"X-API-Key": key})
@@ -118,3 +123,47 @@ def test_capture_expired(client):
         db.execute(update(CaptureSession).values(expires_at=utcnow() - timedelta(minutes=1)))
         db.commit()
     assert client.get(f"/capture/{token}").status_code == 410
+
+
+def test_capture_redirect_carries_only_session_id(client, fake_infra):
+    _, key = make_tenant()
+    bad = client.post("/v1/sessions", json={"redirect_url": "javascript:alert(1)"}, headers={"X-API-Key": key})
+    assert bad.status_code == 422 and bad.json()["error"]["code"] == "INVALID_REDIRECT_URL"
+
+    r = client.post(
+        "/v1/sessions", json={"redirect_url": "https://shop.example/done?u=7"}, headers={"X-API-Key": key}
+    ).json()
+    token = r["capture_url"].split("/capture/")[1]
+    csrf = client.get(f"/capture/{token}").cookies.get("csrf")
+    ok = client.post(f"/capture/{token}/submit", files=files(), headers={"X-CSRF-Token": csrf}).json()
+    assert ok["redirect_url"] == f"https://shop.example/done?u=7&session_id={r['session_id']}"
+
+
+def test_capture_without_redirect(client):
+    _, key = make_tenant()
+    token = _session(client, key)
+    csrf = client.get(f"/capture/{token}").cookies.get("csrf")
+    ok = client.post(f"/capture/{token}/submit", files=files(), headers={"X-CSRF-Token": csrf}).json()
+    assert ok == {"status": "received", "redirect_url": None}
+
+
+def test_mounted_under_prefix(fake_infra):
+    _, queued = fake_infra
+    _, key = make_tenant()
+    host = FastAPI()
+    host.mount("/kyc", create_app())
+    client = TestClient(host)
+    token = client.post("/kyc/v1/sessions", json={}, headers={"X-API-Key": key}).json()["capture_url"]
+    token = token.split("/capture/")[1]
+    page = client.get(f"/kyc/capture/{token}")
+    assert page.status_code == 200 and "/kyc/static/capture.js" in page.text
+    assert "content-security-policy" in page.headers
+    assert f"Path=/kyc/capture/{token}" in page.headers["set-cookie"]
+    ok = client.post(f"/kyc/capture/{token}/submit", files=files(), headers={"X-CSRF-Token": page.cookies["csrf"]})
+    assert ok.status_code == 200 and len(queued) == 1
+
+
+def test_in_memory_rate_limit(monkeypatch):
+    app_module._hits.clear()
+    assert [app_module.rate_hit("rl:t:1") for _ in range(3)] == [1, 2, 3]
+    assert app_module.rate_hit("rl:t:2") == 1

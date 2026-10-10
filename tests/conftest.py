@@ -3,26 +3,35 @@ import os
 import tempfile
 from pathlib import Path
 
-from cryptography.fernet import Fernet
+import pytest
+from PIL import Image
 
-# Settings are read at import time, so configure before importing the app.
+ROOT = Path(__file__).parents[1]
+FIXTURES = Path(__file__).parent / "fixtures"
+SPECIMEN = ROOT / "src/id_verification/core/assets/specimen_ktp.jpg"
+
+# Settings are cached on first use, so configure before anything reads them. Lite mode: no Redis, no S3.
 _tmp = tempfile.mkdtemp()
 os.environ.update(
-    DATA_ENCRYPTION_KEY=Fernet.generate_key().decode(),
+    DATA_DIR=_tmp,
     DATABASE_URL=f"sqlite:///{_tmp}/test.db",
-    REDIS_URL="redis://localhost:6399/0",
+    MODELS_DIR=os.environ.get("MODELS_DIR", str(ROOT / "models")),
     LLM_MODEL="openai:test-model",
     OPENAI_API_KEY="test",
     WEBHOOK_ALLOW_HTTP="false",
+    # empty, not unset: a developer's .env must not switch the tests to Redis / S3
+    REDIS_URL="",
+    S3_BUCKET="",
+    LLM_BASE_URL="",
 )
+try:
+    from cryptography.fernet import Fernet
 
-import pytest  # noqa: E402
-from PIL import Image  # noqa: E402
+    os.environ["DATA_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+except ImportError:  # core-only install
+    pass
 
-from app import security  # noqa: E402
-from app.db import Base, Tenant, engine, session  # noqa: E402
-
-FIXTURES = Path(__file__).parent / "fixtures"
+HAS_SERVER = "DATA_ENCRYPTION_KEY" in os.environ
 
 
 def fixture_bytes(name: str) -> bytes:
@@ -40,6 +49,11 @@ def jpeg(w: int = 640, h: int = 480) -> bytes:
 
 @pytest.fixture(autouse=True)
 def db_schema():
+    if not HAS_SERVER:
+        yield
+        return
+    from id_verification.server.db import Base, engine
+
     Base.metadata.drop_all(engine())
     Base.metadata.create_all(engine())
     yield
@@ -47,21 +61,22 @@ def db_schema():
 
 @pytest.fixture
 def fake_infra(monkeypatch):
-    """In-memory storage, no Redis, no broker. Returns (blobs, enqueued ids)."""
-    import app.main as main
-    import app.worker as worker
+    """In-memory storage, no rate limit, no background queue. Returns (blobs, enqueued (job, id) pairs)."""
+    from id_verification.server import app, queue, storage
 
     blobs, queued = {}, []
-    monkeypatch.setattr("app.storage.put", lambda k, d: blobs.__setitem__(k, d))
-    monkeypatch.setattr("app.storage.get", lambda k: blobs[k])
-    monkeypatch.setattr("app.storage.delete", lambda k: blobs.pop(k, None))
-    monkeypatch.setattr(main, "rate_hit", lambda key: 1)
-    monkeypatch.setattr(worker.process_verification, "delay", lambda vid: queued.append(vid))
-    monkeypatch.setattr(worker.deliver_webhook, "delay", lambda vid: None)
+    monkeypatch.setattr(storage, "put", lambda k, d: blobs.__setitem__(k, d))
+    monkeypatch.setattr(storage, "get", lambda k: blobs[k])
+    monkeypatch.setattr(storage, "delete", lambda k: blobs.pop(k, None))
+    monkeypatch.setattr(app, "rate_hit", lambda key: 1)
+    monkeypatch.setattr(queue, "enqueue", lambda job, vid: queued.append((job, vid)))
     return blobs, queued
 
 
-def make_tenant(name: str = "acme", webhook_url: str | None = None) -> tuple[Tenant, str]:
+def make_tenant(name: str = "acme", webhook_url: str | None = None):
+    from id_verification.server import security
+    from id_verification.server.db import Tenant, session
+
     key = security.new_api_key()
     with session() as db:
         t = Tenant(

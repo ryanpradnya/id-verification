@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
 
-from app.config import get_settings
+from id_verification.config import get_settings
 
 
 def new_api_key() -> str:
@@ -29,7 +29,10 @@ def sha256(value: str) -> str:
 
 @lru_cache
 def _fernet() -> Fernet:
-    return Fernet(get_settings().data_encryption_key)
+    key = get_settings().data_encryption_key
+    if not key:
+        raise RuntimeError("DATA_ENCRYPTION_KEY is required by the server: run `id-verification gen-key`")
+    return Fernet(key)
 
 
 def encrypt(data: bytes) -> bytes:
@@ -75,6 +78,14 @@ def check_webhook_url(url: str, allow_http: bool = False) -> None:
     for info in infos:
         if not ipaddress.ip_address(info[4][0]).is_global:
             raise ValueError("webhook host resolves to a non-public address")
+
+
+def check_redirect_url(url: str, allow_http: bool = False) -> None:
+    """Raise ValueError unless url is an absolute https (or dev http) URL. The browser follows it,
+    not the server, so no SSRF resolution check is needed; this only blocks javascript:/data: etc."""
+    parts = urlsplit(url)
+    if parts.scheme not in (("https", "http") if allow_http else ("https",)) or not parts.hostname:
+        raise ValueError("redirect url must be an absolute https url")
 
 
 def mask_nik(nik: str | None) -> str | None:

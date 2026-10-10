@@ -1,16 +1,25 @@
-"""FastAPI app: REST API (/v1) + hosted camera capture page (/capture)."""
+"""FastAPI app: REST API (/v1) + hosted camera capture page (/capture).
+
+Standalone:  id-verification serve
+Mounted:     idv = create_app(settings)
+             app = FastAPI(lifespan=idv.router.lifespan_context)  # starts the lite worker
+             app.mount("/kyc", idv)                               # PUBLIC_BASE_URL=https://host/kyc
+"""
 
 import base64
 import binascii
 import hmac
+import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from functools import lru_cache
+from importlib.metadata import version
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-import redis
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,17 +32,21 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app import security, storage
-from app.config import get_settings
-from app.db import CaptureSession, Tenant, Verification, aware, get_db, new_id, utcnow
-from app.pipeline.images import InvalidImage, sanitize
-from app.schemas import SessionCreate, SessionOut, VerificationJSON, VerificationOut, verification_out
+from id_verification.config import Settings, get_settings, set_settings
+from id_verification.core.images import InvalidImage, sanitize
+from id_verification.server import queue, security, storage
+from id_verification.server.db import CaptureSession, Tenant, Verification, aware, get_db, new_id, utcnow
+from id_verification.server.schemas import (
+    SessionCreate,
+    SessionOut,
+    VerificationJSON,
+    VerificationOut,
+    verification_out,
+)
 
 HERE = Path(__file__).parent
-settings = get_settings()
-app = FastAPI(title="KTP Verification API", version="1.0.0")
-app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 templates = Jinja2Templates(directory=HERE / "templates")
+router = APIRouter()
 
 CAPTURE_CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; "
@@ -54,28 +67,24 @@ def _errors(e: ValidationError | RequestValidationError) -> list[dict]:
     return [{"loc": list(x["loc"]), "msg": x["msg"]} for x in e.errors()]
 
 
-@app.exception_handler(ApiError)
 async def _api_error(_: Request, e: ApiError):
     return _error(e.status, e.code, e.message)
 
 
-@app.exception_handler(StarletteHTTPException)
 async def _http_error(_: Request, e: StarletteHTTPException):
     return _error(e.status_code, f"HTTP_{e.status_code}", e.detail, getattr(e, "headers", None))
 
 
-@app.exception_handler(RequestValidationError)
 async def _validation_error(_: Request, e: RequestValidationError):
     return _error(422, "VALIDATION_ERROR", _errors(e))
 
 
-@app.middleware("http")
 async def security_headers(request: Request, call_next):
     resp = await call_next(request)
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["X-Frame-Options"] = "DENY"
-    if request.url.path.startswith("/capture"):
+    if "/capture/" in request.url.path:
         resp.headers["Content-Security-Policy"] = CAPTURE_CSP
         resp.headers["Permissions-Policy"] = "camera=(self), microphone=(), geolocation=()"
         resp.headers["Cache-Control"] = "no-store"
@@ -86,17 +95,31 @@ async def security_headers(request: Request, call_next):
 
 
 @lru_cache
-def _redis() -> redis.Redis:
-    return redis.Redis.from_url(settings.redis_url)
+def _redis():
+    import redis  # lazy: optional [scale] extra
+
+    return redis.Redis.from_url(get_settings().redis_url)
+
+
+_hits: dict[str, int] = {}
+_hits_lock = threading.Lock()
 
 
 def rate_hit(key: str) -> int:
-    """Fixed-window counter; returns hits in the current minute."""
-    r = _redis()
-    n = r.incr(key)
-    if n == 1:
-        r.expire(key, 60)
-    return n
+    """Fixed-window counter; returns hits in the current minute. Redis when configured, else in memory."""
+    if get_settings().redis_url:
+        r = _redis()
+        n = r.incr(key)
+        if n == 1:
+            r.expire(key, 60)
+        return n
+    with _hits_lock:
+        if len(_hits) > 10_000:  # drop past windows
+            window = key.rsplit(":", 1)[1]
+            for k in [k for k in _hits if not k.endswith(":" + window)]:
+                del _hits[k]
+        _hits[key] = n = _hits.get(key, 0) + 1
+        return n
 
 
 def current_tenant(
@@ -105,7 +128,7 @@ def current_tenant(
     tenant = x_api_key and db.scalar(select(Tenant).where(Tenant.api_key_hash == security.sha256(x_api_key)))
     if not tenant or not tenant.active:
         raise ApiError(401, "UNAUTHORIZED", "missing or invalid X-API-Key")
-    if rate_hit(f"rl:{tenant.id}:{int(time.time() // 60)}") > settings.rate_limit_per_minute:
+    if rate_hit(f"rl:{tenant.id}:{int(time.time() // 60)}") > get_settings().rate_limit_per_minute:
         raise ApiError(429, "RATE_LIMITED", "too many requests")
     return tenant
 
@@ -117,17 +140,17 @@ DbDep = Annotated[Session, Depends(get_db)]
 # ---------- shared ----------
 
 
-def _check_callback(url: str | None) -> None:
+def _check_url(url: str | None, check, code: str) -> None:
     if url:
         try:
-            security.check_webhook_url(url, settings.webhook_allow_http)
+            check(url, get_settings().webhook_allow_http)
         except ValueError as e:
-            raise ApiError(422, "INVALID_CALLBACK_URL", str(e)) from e
+            raise ApiError(422, code, str(e)) from e
 
 
 def _check_length(request: Request) -> None:
     # Two images plus base64 overhead. Also cap body size at the reverse proxy.
-    if int(request.headers.get("content-length") or 0) > 2 * settings.max_upload_bytes * 4 // 3 + 1_000_000:
+    if int(request.headers.get("content-length") or 0) > 2 * get_settings().max_upload_bytes * 4 // 3 + 1_000_000:
         raise ApiError(413, "PAYLOAD_TOO_LARGE", "request body too large")
 
 
@@ -135,12 +158,13 @@ async def _read_upload(form, field: str) -> bytes:
     f = form.get(field)
     if not isinstance(f, UploadFile):
         raise ApiError(422, "VALIDATION_ERROR", f"file field '{field}' is required")
-    return await f.read(settings.max_upload_bytes + 1)
+    return await f.read(get_settings().max_upload_bytes + 1)
 
 
 def _clean(ktp: bytes, selfie: bytes) -> tuple[bytes, bytes]:
+    limit = get_settings().max_upload_bytes
     try:
-        return sanitize(ktp, settings.max_upload_bytes), sanitize(selfie, settings.max_upload_bytes)
+        return sanitize(ktp, limit), sanitize(selfie, limit)
     except InvalidImage as e:
         raise ApiError(422, "INVALID_IMAGE", str(e)) from e
 
@@ -149,8 +173,6 @@ def _create_verification(
     db: Session, tenant_id: str, ktp: bytes, selfie: bytes, external_ref, callback_url, idem_key=None
 ) -> Verification:
     """ktp/selfie must already be sanitized by _clean."""
-    from app.worker import process_verification  # lazy: keeps the API importable without a broker
-
     vid = new_id()
     v = Verification(
         id=vid,
@@ -165,7 +187,7 @@ def _create_verification(
     storage.put(v.selfie_key, selfie)
     db.add(v)
     db.commit()
-    process_verification.delay(vid)
+    queue.enqueue("process_verification", vid)
     return v
 
 
@@ -199,7 +221,7 @@ def _by_idempotency_key(db: Session, tenant_id: str, key: str) -> Verification |
     )
 
 
-@app.post("/v1/verifications", status_code=202, response_model=VerificationOut, openapi_extra=_UPLOAD_DOC)
+@router.post("/v1/verifications", status_code=202, response_model=VerificationOut, openapi_extra=_UPLOAD_DOC)
 async def create_verification(
     request: Request,
     tenant: TenantDep,
@@ -229,8 +251,8 @@ async def create_verification(
 
     if external_ref and len(external_ref) > 200:
         raise ApiError(422, "VALIDATION_ERROR", "external_ref too long")
-    _check_callback(callback_url)
-    # Pillow, S3 and DB calls are blocking: keep them off the event loop.
+    _check_url(callback_url, security.check_webhook_url, "INVALID_CALLBACK_URL")
+    # Pillow, storage and DB calls are blocking: keep them off the event loop.
     ktp, selfie = await run_in_threadpool(_clean, ktp, selfie)
     try:
         v = await run_in_threadpool(
@@ -242,7 +264,7 @@ async def create_verification(
     return verification_out(v)
 
 
-@app.get("/v1/verifications/{vid}", response_model=VerificationOut)
+@router.get("/v1/verifications/{vid}", response_model=VerificationOut)
 def get_verification(vid: str, tenant: TenantDep, db: DbDep):
     v = db.get(Verification, vid)
     if v is None or v.tenant_id != tenant.id:  # same 404 either way: no cross-tenant existence leak
@@ -250,26 +272,29 @@ def get_verification(vid: str, tenant: TenantDep, db: DbDep):
     return verification_out(v)
 
 
-@app.post("/v1/sessions", status_code=201, response_model=SessionOut)
+@router.post("/v1/sessions", status_code=201, response_model=SessionOut)
 def create_session(body: SessionCreate, tenant: TenantDep, db: DbDep):
     """Create a hosted camera-capture link for your end user. Single use, short-lived."""
-    _check_callback(body.callback_url)
+    s = get_settings()
+    _check_url(body.callback_url, security.check_webhook_url, "INVALID_CALLBACK_URL")
+    _check_url(body.redirect_url, security.check_redirect_url, "INVALID_REDIRECT_URL")
     token = security.new_token()
-    s = CaptureSession(
+    cs = CaptureSession(
         tenant_id=tenant.id,
         token_hash=security.sha256(token),
         external_ref=body.external_ref,
         callback_url=body.callback_url,
-        expires_at=utcnow() + timedelta(minutes=settings.capture_session_minutes),
+        redirect_url=body.redirect_url,
+        expires_at=utcnow() + timedelta(minutes=s.capture_session_minutes),
     )
-    db.add(s)
+    db.add(cs)
     db.commit()
     return SessionOut(
-        session_id=s.id, capture_url=f"{settings.public_base_url}/capture/{token}", expires_at=s.expires_at
+        session_id=cs.id, capture_url=f"{s.public_base_url.rstrip('/')}/capture/{token}", expires_at=cs.expires_at
     )
 
 
-@app.get("/healthz")
+@router.get("/healthz")
 def healthz(db: DbDep):
     db.execute(text("SELECT 1"))
     return {"status": "ok"}
@@ -285,7 +310,13 @@ def _open_session(db: Session, token: str) -> CaptureSession | None:
     return s
 
 
-@app.get("/capture/{token}", response_class=HTMLResponse, include_in_schema=False)
+def _with_session_id(url: str, session_id: str) -> str:
+    parts = urlsplit(url)
+    query = urlencode([*parse_qsl(parts.query), ("session_id", session_id)])
+    return urlunsplit(parts._replace(query=query))
+
+
+@router.get("/capture/{token}", response_class=HTMLResponse, include_in_schema=False)
 def capture_page(request: Request, token: str, db: DbDep):
     if _open_session(db, token) is None:
         ctx = {"title": "Link expired", "message": "This verification link is invalid, already used, or expired."}
@@ -298,13 +329,13 @@ def capture_page(request: Request, token: str, db: DbDep):
         httponly=True,
         samesite="strict",
         secure=request.url.scheme == "https",
-        path=f"/capture/{token}",
-        max_age=settings.capture_session_minutes * 60,
+        path=f"{request.scope.get('root_path', '')}/capture/{token}",
+        max_age=get_settings().capture_session_minutes * 60,
     )
     return resp
 
 
-@app.post("/capture/{token}/submit", include_in_schema=False)
+@router.post("/capture/{token}/submit", include_in_schema=False)
 async def capture_submit(request: Request, token: str, db: DbDep, x_csrf_token: Annotated[str | None, Header()] = None):
     cookie = request.cookies.get("csrf")
     if not cookie or not x_csrf_token or not hmac.compare_digest(cookie, x_csrf_token):
@@ -327,4 +358,32 @@ async def capture_submit(request: Request, token: str, db: DbDep, x_csrf_token: 
     v = await run_in_threadpool(_create_verification, db, s.tenant_id, ktp, selfie, s.external_ref, s.callback_url)
     s.verification_id = v.id
     db.commit()
-    return {"status": "received"}
+    # The redirect only carries the session id. The result goes by webhook, so it cannot be forged in a URL.
+    return {"status": "received", "redirect_url": _with_session_id(s.redirect_url, s.id) if s.redirect_url else None}
+
+
+# ---------- app ----------
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    storage.ensure_ready()
+    queue.start_local()
+    yield
+    queue.stop_local()
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    """One app per process. Pass settings to configure in code instead of env vars."""
+    if settings is not None:
+        set_settings(settings)
+    if not get_settings().data_encryption_key:
+        raise RuntimeError("DATA_ENCRYPTION_KEY is required by the server: run `id-verification gen-key`")
+    app = FastAPI(title="ID Verification API", version=version("id-verification"), lifespan=lifespan)
+    app.include_router(router)
+    app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
+    app.add_exception_handler(ApiError, _api_error)
+    app.add_exception_handler(StarletteHTTPException, _http_error)
+    app.add_exception_handler(RequestValidationError, _validation_error)
+    app.middleware("http")(security_headers)
+    return app

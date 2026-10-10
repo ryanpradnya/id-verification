@@ -1,33 +1,67 @@
 [project]
 name = "id-verification"
 version = "0.1.0"
-description = "KYC-as-a-service: Indonesian KTP + live selfie verification (FastAPI, LangGraph, local biometrics)"
-requires-python = ">=3.13"
-dependencies = [
-    "alembic>=1.20.0",
-    "boto3>=1.43.111",
-    "celery[redis]>=5.6.3",
-    "cryptography>=50.0.2",
-    "fastapi>=0.143.0",
-    "httpx>=0.28.1",
-    "jinja2>=3.1.6",
-    "langchain>=1.4.4",
-    "langchain-anthropic>=1.7.5",
-    "langchain-deepseek>=1.1.1",
-    "langchain-openai>=1.7.0",
-    "langchain-openrouter>=0.2.9",
-    "langgraph>=1.2.14",
-    "numpy>=2.5.3",
-    "onnxruntime>=1.31.0",
-    "opencv-python-headless>=5.0.0.93",
-    "pillow>=12.3.0",
-    "psycopg[binary]>=3.3.6",
-    "pydantic-settings>=2.15.0",
-    "python-multipart>=0.0.32",
-    "redis>=6.4.0",
-    "sqlalchemy>=2.1.4",
-    "uvicorn[standard]>=0.54.0",
+description = "Indonesian KTP + live selfie verification: Python library and self-hostable API with hosted camera page"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+keywords = ["kyc", "ktp", "e-ktp", "indonesia", "identity-verification", "face-verification", "liveness"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
 ]
+# Core = the verification pipeline only. No web framework, database, queue or cloud SDK.
+dependencies = [
+    "langchain>=1.4.4",
+    "langchain-openai>=1.7.0", # also covers every OpenAI-compatible local server (Ollama, vLLM, ...)
+    "langgraph>=1.2.14",
+    "numpy>=2.0",
+    "onnxruntime>=1.20",
+    "opencv-python-headless>=4.10",
+    "pillow>=11.0",
+    "pydantic-settings>=2.6",
+]
+
+[project.optional-dependencies]
+# Self-hosted API + camera page. Lite by default: SQLite, in-process worker, local disk.
+server = [
+    "alembic>=1.14",
+    "cryptography>=44",
+    "fastapi>=0.115",
+    "httpx>=0.28",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.20",
+    "sqlalchemy>=2.0",
+    "uvicorn[standard]>=0.32",
+]
+# Production scale: Postgres, Celery/Redis, S3. Enabled by setting DATABASE_URL / REDIS_URL / S3_BUCKET.
+scale = [
+    "boto3>=1.35",
+    "celery[redis]>=5.4",
+    "psycopg[binary]>=3.2",
+    "redis>=5.2",
+]
+# No-LLM mode: local OCR reads the KTP.
+ocr = ["rapidocr>=3.0"]
+anthropic = ["langchain-anthropic>=1.0"]
+openrouter = ["langchain-openrouter>=0.2"]
+deepseek = ["langchain-deepseek>=1.0"]
+all = ["id-verification[server,scale,ocr,anthropic,openrouter,deepseek]"]
+
+[project.scripts]
+id-verification = "id_verification.cli:main"
+
+[project.urls]
+Repository = "https://github.com/ryanpradnya/id-verification"
+Issues = "https://github.com/ryanpradnya/id-verification/issues"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
@@ -40,12 +74,12 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py313"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "S"]
 ignore = ["S101"]  # assert is fine in tests
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S105", "S106"]
-"alembic/versions/*" = ["E501"]
+"tests/*" = ["S105", "S106", "S603", "S608"]
+"src/id_verification/server/migrations/versions/*" = ["E501"]
